@@ -76,15 +76,15 @@ const DB = (() => {
     exportAll() {
       return { exportedAt: new Date().toISOString(), ...Object.fromEntries(COLS.map(c => [c, _c[c]])) };
     },
-    importAll(data) {
-      COLS.forEach(async c => {
-        if (!data[c]) return;
-        _c[c] = data[c];
-        const batch = _db.batch();
-        data[c].forEach(doc => batch.set(_db.collection(c).doc(doc.id), doc));
-        await batch.commit();
-      });
-    },
+    async importAll(data) {
+  await Promise.all(COLS.map(async c => {
+    if (!data[c]) return;
+    _c[c] = data[c];
+    const batch = _db.batch();
+    data[c].forEach(doc => batch.set(_db.collection(c).doc(doc.id), doc));
+    await batch.commit();
+  }));
+},
     saveUnit(unit) {
       if (!unit) return;
       const stored = JSON.parse(localStorage.getItem('vi3__units') || '[]');
@@ -3912,7 +3912,18 @@ function exportDataJSON() {
 }
 function importDataJSON(file) {
   if (!file) return; const r = new FileReader();
-  r.onload = e => { try { const d = JSON.parse(e.target.result); if (!confirm(`Import from ${d.exportedAt ? new Date(d.exportedAt).toLocaleString('en-IN') : 'unknown'}?\nThis will REPLACE all current data.`)) return; DB.importAll(d); location.reload(); } catch { toast('Invalid backup file', 'danger'); } };
+  r.onload = async e => {
+    try {
+      const d = JSON.parse(e.target.result);
+      if (!confirm(`Import from ${d.exportedAt ? new Date(d.exportedAt).toLocaleString('en-IN') : 'unknown'}?\nThis will REPLACE all current data.`)) return;
+      toast('Importing… please wait');
+      await DB.importAll(d);
+      location.reload();
+    } catch (err) {
+      console.error('Import failed:', err);
+      toast('Import failed: ' + (err.message || 'Invalid backup file'), 'danger');
+    }
+  };
   r.readAsText(file);
 }
 function confirmDeleteAllData() {
