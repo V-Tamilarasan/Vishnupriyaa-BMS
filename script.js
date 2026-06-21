@@ -2,33 +2,41 @@ const DB = (() => {
   const COLS = ['materials','bills','workers','templates','issuances',
                 'productions','finished','sales','wagePayments','polishJobs','salePayments'];
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
-
+ 
   // Local cache — still used for all synchronous reads
   COLS.forEach(c => { _c[c] = []; });
-
+ 
+  const myUid = () => _auth.currentUser ? _auth.currentUser.uid : null;
+ 
   // Load all collections from Firestore into cache on startup
+  // NOW SCOPED: only fetches documents owned by the current signed-in user
   async function loadAll() {
+    const ownerId = myUid();
+    if (!ownerId) { console.warn('loadAll() called with no signed-in user'); return; }
     await Promise.all(COLS.map(async c => {
-      const snap = await _db.collection(c).orderBy('createdAt','desc').get();
+      const snap = await _db.collection(c)
+        .where('ownerId', '==', ownerId)
+        .orderBy('createdAt','desc')
+        .get();
       _c[c] = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     }));
     updateCounts();
     renderDashboard();
   }
-
+ 
   const save = async (c, doc) => {
     await _db.collection(c).doc(doc.id).set(doc);
   };
-
+ 
   const remove = async (c, id) => {
     await _db.collection(c).doc(id).delete();
   };
-
+ 
   return {
     all: c => [...(_c[c] || [])],
     find: (c, id) => (_c[c] || []).find(d => d.id === id) || null,
     insert(c, d) {
-      const doc = { id: uid(), createdAt: Date.now(), ...d };
+      const doc = { id: uid(), createdAt: Date.now(), ownerId: myUid(), ...d };
       _c[c].unshift(doc);
       save(c, doc);
       return doc;
@@ -36,7 +44,8 @@ const DB = (() => {
     update(c, id, d) {
       const i = (_c[c] || []).findIndex(x => x.id === id);
       if (i === -1) return null;
-      _c[c][i] = { ..._c[c][i], ...d, updatedAt: Date.now() };
+      // ownerId is never overwritten by an update payload
+      _c[c][i] = { ..._c[c][i], ...d, ownerId: _c[c][i].ownerId, updatedAt: Date.now() };
       save(c, _c[c][i]);
       return _c[c][i];
     },
@@ -58,7 +67,7 @@ const DB = (() => {
       items.forEach(it => {
         const ex = (_c.materials || []).find(m => m.name === it.mat);
         if (ex) { ex.qty = parseFloat(ex.qty || 0) + parseFloat(it.qty); if (!ex.unitCost && it.price) ex.unitCost = it.price; save('materials', ex); }
-        else { const doc = { id: uid(), createdAt: Date.now(), name: it.mat, category: '', unit: it.unit || '', qty: parseFloat(it.qty), minLevel: 10, unitCost: it.price || 0 }; _c.materials.unshift(doc); save('materials', doc); }
+        else { const doc = { id: uid(), createdAt: Date.now(), ownerId: myUid(), name: it.mat, category: '', unit: it.unit || '', qty: parseFloat(it.qty), minLevel: 10, unitCost: it.price || 0 }; _c.materials.unshift(doc); save('materials', doc); }
       });
     },
     workerHolding(workerId, matName) {
@@ -67,9 +76,10 @@ const DB = (() => {
     },
     isSerialUnique: sn => !(_c.finished || []).some(f => f.serialNumber === sn),
     clearAll() {
+      const ownerId = myUid();
       COLS.forEach(async c => {
         _c[c] = [];
-        const snap = await _db.collection(c).get();
+        const snap = await _db.collection(c).where('ownerId', '==', ownerId).get();
         snap.docs.forEach(d => d.ref.delete());
       });
     },
@@ -77,14 +87,18 @@ const DB = (() => {
       return { exportedAt: new Date().toISOString(), ...Object.fromEntries(COLS.map(c => [c, _c[c]])) };
     },
     async importAll(data) {
-  await Promise.all(COLS.map(async c => {
-    if (!data[c]) return;
-    _c[c] = data[c];
-    const batch = _db.batch();
-    data[c].forEach(doc => batch.set(_db.collection(c).doc(doc.id), doc));
-    await batch.commit();
-  }));
-},
+      const ownerId = myUid();
+      await Promise.all(COLS.map(async c => {
+        if (!data[c]) return;
+        // Re-stamp every imported doc with the CURRENT user's ownerId
+        // so imported backups always belong to whoever is importing them
+        const stamped = data[c].map(doc => ({ ...doc, ownerId }));
+        _c[c] = stamped;
+        const batch = _db.batch();
+        stamped.forEach(doc => batch.set(_db.collection(c).doc(doc.id), doc));
+        await batch.commit();
+      }));
+    },
     saveUnit(unit) {
       if (!unit) return;
       const stored = JSON.parse(localStorage.getItem('vi3__units') || '[]');
@@ -95,9 +109,46 @@ const DB = (() => {
       const stored = JSON.parse(localStorage.getItem('vi3__units') || '[]');
       return [...new Set([...base, ...stored, ...(_c.materials || []).map(m => m.unit).filter(Boolean)])];
     },
+    /* ═══════════════════════════════════════════════════════
+       ONE-TIME MIGRATION HELPER
+       Run this ONCE from the browser console (F12 → Console tab)
+       while signed in as YOUR account, to claim all existing
+       documents that don't have an ownerId yet.
+ 
+       Usage:  await DB.migrateOwnerlessDocs()
+ 
+       Safe to run more than once — it only touches docs that
+       are missing ownerId, so it won't affect other shops later.
+       ═══════════════════════════════════════════════════════ */
+    async migrateOwnerlessDocs() {
+      const ownerId = myUid();
+      if (!ownerId) { console.error('Sign in first.'); return; }
+      let totalClaimed = 0;
+      for (const c of COLS) {
+        const snap = await _db.collection(c).get();
+        const batch = _db.batch();
+        let count = 0;
+        snap.docs.forEach(d => {
+          const data = d.data();
+          if (!data.ownerId) {
+            batch.update(d.ref, { ownerId });
+            count++;
+          }
+        });
+        if (count > 0) {
+          await batch.commit();
+          console.log(`Claimed ${count} doc(s) in "${c}"`);
+          totalClaimed += count;
+        }
+      }
+      console.log(`Done. Claimed ${totalClaimed} document(s) total. Reloading...`);
+      if (totalClaimed > 0) location.reload();
+      else console.log('Nothing to claim — all documents already have an owner.');
+    },
     loadAll
   };
 })();
+
 
 const fmtMoney = v => '₹' + parseFloat(v || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtNum = v => parseFloat(v || 0).toLocaleString('en-IN');
