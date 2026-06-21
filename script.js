@@ -1,13 +1,25 @@
+/* ═══════════════════════════════════════════════════════════════
+   REPLACE the existing `const DB = (() => { ... })();` block
+   at the top of script.js with this version.
+
+   WHAT CHANGED:
+   - insert() now stamps every new doc with ownerId = current user's uid
+   - loadAll() now only fetches docs where ownerId == current user's uid
+   - clearAll() and importAll() also scoped to ownerId
+   - Added DB.migrateOwnerlessDocs() — a ONE-TIME helper you run once
+     from the browser console to claim your existing data
+   ═══════════════════════════════════════════════════════════════ */
+
 const DB = (() => {
   const COLS = ['materials','bills','workers','templates','issuances',
                 'productions','finished','sales','wagePayments','polishJobs','salePayments'];
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
- 
+
   // Local cache — still used for all synchronous reads
   COLS.forEach(c => { _c[c] = []; });
- 
+
   const myUid = () => _auth.currentUser ? _auth.currentUser.uid : null;
- 
+
   // Load all collections from Firestore into cache on startup
   // NOW SCOPED: only fetches documents owned by the current signed-in user
   async function loadAll() {
@@ -23,15 +35,15 @@ const DB = (() => {
     updateCounts();
     renderDashboard();
   }
- 
+
   const save = async (c, doc) => {
     await _db.collection(c).doc(doc.id).set(doc);
   };
- 
+
   const remove = async (c, id) => {
     await _db.collection(c).doc(id).delete();
   };
- 
+
   return {
     all: c => [...(_c[c] || [])],
     find: (c, id) => (_c[c] || []).find(d => d.id === id) || null,
@@ -88,15 +100,25 @@ const DB = (() => {
     },
     async importAll(data) {
       const ownerId = myUid();
+      if (!ownerId) throw new Error('You must be signed in to import data.');
       await Promise.all(COLS.map(async c => {
         if (!data[c]) return;
-        // Re-stamp every imported doc with the CURRENT user's ownerId
-        // so imported backups always belong to whoever is importing them
-        const stamped = data[c].map(doc => ({ ...doc, ownerId }));
+        // Generate a BRAND NEW id for every imported doc instead of reusing
+        // the id from the backup file. This guarantees we never collide
+        // with a document that already exists (possibly owned by someone
+        // else), which is what was causing "Missing or insufficient
+        // permissions" — a batch.set() on an existing doc id is treated
+        // as an UPDATE by the security rules, and is rejected unless the
+        // existing doc's ownerId already matches you.
+        const stamped = data[c].map(doc => ({ ...doc, id: uid(), ownerId }));
         _c[c] = stamped;
-        const batch = _db.batch();
-        stamped.forEach(doc => batch.set(_db.collection(c).doc(doc.id), doc));
-        await batch.commit();
+        // Firestore batches max out at 500 writes — chunk to be safe
+        for (let i = 0; i < stamped.length; i += 450) {
+          const chunk = stamped.slice(i, i + 450);
+          const batch = _db.batch();
+          chunk.forEach(doc => batch.set(_db.collection(c).doc(doc.id), doc));
+          await batch.commit();
+        }
       }));
     },
     saveUnit(unit) {
@@ -114,9 +136,9 @@ const DB = (() => {
        Run this ONCE from the browser console (F12 → Console tab)
        while signed in as YOUR account, to claim all existing
        documents that don't have an ownerId yet.
- 
+
        Usage:  await DB.migrateOwnerlessDocs()
- 
+
        Safe to run more than once — it only touches docs that
        are missing ownerId, so it won't affect other shops later.
        ═══════════════════════════════════════════════════════ */
